@@ -122,12 +122,92 @@ is shared between requests.  The result is::
     {"outputs": [bytes, ...], "states": [state, ...]}
 """
 
+import base64
+import hashlib
+import hmac
+import json
+import os
+
 VERSION = 1
 MIN_ENTROPY = 32
 MAX_GENERATE_WITHOUT_RESEED = 8
 MAX_REQUEST_BYTES = 4096
 HEADER = b"DRBG"
 TAG_SIZE = 32
+
+_STATE_FIELDS = frozenset(
+    {
+        "version",
+        "key",
+        "counter",
+        "generation",
+        "reseed_counter",
+        "entropy_count",
+        "last_reseed_generation",
+        "instance_id",
+        "invalidated",
+    }
+)
+_INT_FIELDS = (
+    "version",
+    "counter",
+    "generation",
+    "reseed_counter",
+    "entropy_count",
+    "last_reseed_generation",
+)
+_UINT64_MAX = (1 << 64) - 1
+
+# Process-local rollback high-water mark: instance_id -> greatest generation
+# ever restored via deserialize in this process.
+_ROLLBACK_MARK: dict[bytes, int] = {}
+
+
+def _lp(data: bytes) -> bytes:
+    """Length-prefix a byte string: len(data) as 4 big-endian bytes + data."""
+    return len(data).to_bytes(4, "big") + data
+
+
+def _digest(data: bytes) -> bytes:
+    return hashlib.sha256(data).digest()
+
+
+def _require_bytes(value, name: str) -> None:
+    if not isinstance(value, bytes):
+        raise ValueError(f"{name} must be bytes, got {type(value).__name__}")
+
+
+def _validate_state(state: dict, allow_invalidated: bool = False) -> None:
+    """Validate the shape and value types of a state dict.
+
+    Raises ValueError for any malformed state and for consumed states unless
+    ``allow_invalidated`` is set (used by check_health, which reports the
+    condition instead of refusing to run).
+    """
+    if not isinstance(state, dict):
+        raise ValueError("state must be a dict")
+    if set(state.keys()) != _STATE_FIELDS:
+        raise ValueError("state has missing or unknown fields")
+    if state["version"] != VERSION:
+        raise ValueError(f"unsupported state version: {state['version']!r}")
+    if not isinstance(state["key"], bytes) or len(state["key"]) != 32:
+        raise ValueError("state key must be exactly 32 bytes")
+    if not isinstance(state["instance_id"], bytes) or len(state["instance_id"]) != 16:
+        raise ValueError("instance_id must be exactly 16 bytes")
+    if not isinstance(state["invalidated"], bool):
+        raise ValueError("invalidated must be a bool")
+    for field in _INT_FIELDS:
+        value = state[field]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{field} must be an int")
+        if value < 0:
+            raise ValueError(f"{field} must be non-negative")
+    if state["counter"] > _UINT64_MAX:
+        raise ValueError("counter exceeds the 64-bit block-counter range")
+    if state["last_reseed_generation"] > state["generation"]:
+        raise ValueError("last_reseed_generation cannot exceed generation")
+    if not allow_invalidated and state["invalidated"]:
+        raise ValueError("state has been invalidated by a prediction-resistance refresh")
 
 
 def instantiate(entropy: bytes, nonce: bytes, personalization: bytes) -> dict:
@@ -137,7 +217,40 @@ def instantiate(entropy: bytes, nonce: bytes, personalization: bytes) -> dict:
     argument is not bytes.  Returns the state dict described in the module
     docstring.
     """
-    raise NotImplementedError("instantiate is not implemented")
+    # Defect 6 fix: insufficient entropy is an error, never zero-padded.
+    _require_bytes(entropy, "entropy")
+    _require_bytes(nonce, "nonce")
+    _require_bytes(personalization, "personalization")
+    if len(entropy) < MIN_ENTROPY:
+        raise ValueError(
+            f"at least {MIN_ENTROPY} bytes of entropy are required, "
+            f"got {len(entropy)}"
+        )
+
+    key = _digest(
+        b"sec-drbg/v1/instantiate"
+        + _lp(entropy)
+        + _lp(nonce)
+        + _lp(personalization)
+    )
+    instance_id = _digest(
+        b"sec-drbg/v1/instance"
+        + _lp(entropy)
+        + _lp(nonce)
+        + _lp(personalization)
+    )[:16]
+
+    return {
+        "version": VERSION,
+        "key": key,
+        "counter": 0,
+        "generation": 0,
+        "reseed_counter": 0,
+        "entropy_count": len(entropy),
+        "last_reseed_generation": 0,
+        "instance_id": instance_id,
+        "invalidated": False,
+    }
 
 
 def generate(state: dict, nbytes: int, additional: bytes) -> dict:
@@ -147,7 +260,44 @@ def generate(state: dict, nbytes: int, additional: bytes) -> dict:
     an invalidated state.  The returned state is a fresh dict; the input is not
     mutated.
     """
-    raise NotImplementedError("generate is not implemented")
+    _validate_state(state)
+    _require_bytes(additional, "additional")
+    if isinstance(nbytes, bool) or not isinstance(nbytes, int):
+        raise ValueError("nbytes must be an int")
+    # Defect 8 fix: zero-length (and overlong) requests are rejected before any
+    # state movement, so the call sequence cannot be desynchronised.
+    if nbytes <= 0 or nbytes > MAX_REQUEST_BYTES:
+        raise ValueError(
+            f"nbytes must be within 1..{MAX_REQUEST_BYTES}, got {nbytes}"
+        )
+
+    key = state["key"]
+    counter = state["counter"]
+    blocks = (nbytes + 31) // 32
+    if counter + blocks > _UINT64_MAX:
+        raise ValueError("block counter would overflow its 64-bit range")
+
+    # Defect 2 fix: every block consumes and advances the block counter, so
+    # repeated calls produce distinct output instead of replaying bytes.
+    output = bytearray()
+    for _ in range(blocks):
+        message = (
+            b"sec-drbg/v1/generate"
+            + counter.to_bytes(8, "big")
+            + _lp(additional)
+        )
+        output.extend(hmac.new(key, message, hashlib.sha256).digest())
+        counter += 1
+    output = bytes(output[:nbytes])
+
+    # Defect 2 fix (cont.): after output, the key is ratcheted and the revision
+    # counters advance in a fresh state; the input state is left untouched.
+    new_state = dict(state)
+    new_state["key"] = _digest(b"sec-drbg/v1/ratchet" + key + output)
+    new_state["counter"] = counter
+    new_state["generation"] = state["generation"] + 1
+    new_state["reseed_counter"] = state["reseed_counter"] + 1
+    return {"state": new_state, "output": output}
 
 
 def reseed(state: dict, entropy: bytes, additional: bytes) -> dict:
@@ -157,7 +307,36 @@ def reseed(state: dict, entropy: bytes, additional: bytes) -> dict:
     ValueError.  Entropy is accumulated, never used as a replacement for the
     old key material.  The old state dict is not invalidated.
     """
-    raise NotImplementedError("reseed is not implemented")
+    _validate_state(state)
+    _require_bytes(entropy, "entropy")
+    _require_bytes(additional, "additional")
+    # Defect 6 applies here too: short entropy is rejected, never padded.
+    if len(entropy) < MIN_ENTROPY:
+        raise ValueError(
+            f"at least {MIN_ENTROPY} bytes of entropy are required, "
+            f"got {len(entropy)}"
+        )
+
+    # Defect 1 fix: derive the new key from BOTH the old state material and the
+    # fresh entropy instead of replacing the state outright.
+    new_key = _digest(
+        b"sec-drbg/v1/reseed"
+        + _lp(state["key"])
+        + state["counter"].to_bytes(8, "big")
+        + _lp(entropy)
+        + _lp(additional)
+    )
+
+    new_generation = state["generation"] + 1
+    new_state = dict(state)
+    new_state["key"] = new_key
+    new_state["counter"] = state["counter"] + 1
+    new_state["generation"] = new_generation
+    new_state["reseed_counter"] = 0
+    new_state["entropy_count"] = state["entropy_count"] + len(entropy)
+    new_state["last_reseed_generation"] = new_generation
+    # The old dict stays valid and usable as a historical object.
+    return new_state
 
 
 def serialize(state: dict) -> bytes:
@@ -166,7 +345,28 @@ def serialize(state: dict) -> bytes:
     An invalidated state or a state with unknown fields/version raises
     ValueError.
     """
-    raise NotImplementedError("serialize is not implemented")
+    _validate_state(state)
+
+    payload_dict = {field: state[field] for field in sorted(_STATE_FIELDS)}
+    payload = json.dumps(
+        payload_dict,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=lambda value: base64.b64encode(value).decode("ascii")
+        if isinstance(value, bytes)
+        else _raise_serialize_type(value),
+    ).encode("utf-8")
+
+    # Defect 3 fix: magic and an explicit format version are written, followed
+    # by a length field, so cross-version parsing cannot silently misalign.
+    prefix = HEADER + bytes([VERSION]) + len(payload).to_bytes(4, "big")
+    # Defect 4 fix: a SHA-256 checksum covers every byte preceding the tag.
+    checksum = _digest(prefix + payload)
+    return prefix + payload + checksum
+
+
+def _raise_serialize_type(value):
+    raise ValueError(f"cannot serialise value of type {type(value).__name__}")
 
 
 def deserialize(blob: bytes) -> dict:
@@ -176,7 +376,76 @@ def deserialize(blob: bytes) -> dict:
     mismatch, checksum failure, malformed payload, invalidated state, or a
     generation below the process-local high-water mark for that instance.
     """
-    raise NotImplementedError("deserialize is not implemented")
+    if not isinstance(blob, bytes):
+        raise ValueError("blob must be bytes")
+    # header(4) + version(1) + length(4) + checksum(32), payload may be empty
+    # only in theory; a real payload is longer.
+    if len(blob) < 4 + 1 + 4 + TAG_SIZE:
+        raise ValueError("blob is truncated")
+    if blob[:4] != HEADER:
+        raise ValueError("bad magic header")
+    version = blob[4]
+    # Defect 3 fix (read side): only the supported version is accepted.
+    if version != VERSION:
+        raise ValueError(f"unsupported blob version: {version}")
+    payload_length = int.from_bytes(blob[5:9], "big")
+    if len(blob) != 9 + payload_length + TAG_SIZE:
+        raise ValueError("declared payload length does not match blob size")
+
+    payload = blob[9 : 9 + payload_length]
+    stored_checksum = blob[9 + payload_length :]
+    # Defect 4 fix: verify the checksum before trusting any payload content.
+    expected_checksum = _digest(blob[: 9 + payload_length])
+    if not hmac.compare_digest(stored_checksum, expected_checksum):
+        raise ValueError("checksum mismatch: blob is corrupted or tampered")
+
+    try:
+        raw = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("malformed payload: not valid JSON") from exc
+    if not isinstance(raw, dict) or set(raw.keys()) != _STATE_FIELDS:
+        raise ValueError("malformed payload: missing or unknown fields")
+
+    try:
+        state = {
+            "version": int(raw["version"]),
+            "key": _b64_decode_field(raw["key"], "key"),
+            "counter": int(raw["counter"]),
+            "generation": int(raw["generation"]),
+            "reseed_counter": int(raw["reseed_counter"]),
+            "entropy_count": int(raw["entropy_count"]),
+            "last_reseed_generation": int(raw["last_reseed_generation"]),
+            "instance_id": _b64_decode_field(raw["instance_id"], "instance_id"),
+            "invalidated": bool(raw["invalidated"]),
+        }
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"malformed payload field: {exc}") from exc
+
+    # Full structural validation, including rejection of consumed states.
+    _validate_state(state)
+
+    # Defect 9 fix: a per-instance high-water mark forbids restoring a state
+    # older than one already restored in this process; equal generation is
+    # allowed so a plain round trip stays lossless.
+    instance_id = state["instance_id"]
+    generation = state["generation"]
+    high_water = _ROLLBACK_MARK.get(instance_id)
+    if high_water is not None and generation < high_water:
+        raise ValueError(
+            "rollback rejected: generation "
+            f"{generation} is below restored high-water mark {high_water}"
+        )
+    _ROLLBACK_MARK[instance_id] = generation
+    return state
+
+
+def _b64_decode_field(value, name: str) -> bytes:
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a base64 string")
+    try:
+        return base64.b64decode(value.encode("ascii"), validate=True)
+    except (ValueError, UnicodeEncodeError) as exc:
+        raise ValueError(f"{name} is not valid base64") from exc
 
 
 def predict_resistance(state: dict, additional: bytes) -> dict:
@@ -186,12 +455,53 @@ def predict_resistance(state: dict, additional: bytes) -> dict:
     subsequent generate, reseed or predict_resistance call with it raises
     ValueError.  An already invalidated or malformed input raises ValueError.
     """
-    raise NotImplementedError("predict_resistance is not implemented")
+    _validate_state(state)
+    _require_bytes(additional, "additional")
+
+    fresh = os.urandom(MIN_ENTROPY)
+    new_key = _digest(
+        b"sec-drbg/v1/pr"
+        + _lp(state["key"])
+        + _lp(fresh)
+        + _lp(additional)
+    )
+
+    new_generation = state["generation"] + 1
+    new_state = dict(state)
+    new_state["key"] = new_key
+    new_state["counter"] = state["counter"] + 1
+    new_state["generation"] = new_generation
+    new_state["reseed_counter"] = 0
+    new_state["entropy_count"] = state["entropy_count"] + MIN_ENTROPY
+    new_state["last_reseed_generation"] = new_generation
+    new_state["invalidated"] = False
+
+    # Defect 5 fix: the old state is consumed in place and can never advance
+    # again.  Only the returned state carries a usable continuation.
+    state["invalidated"] = True
+    return new_state
 
 
 def check_health(state: dict) -> list[str]:
     """Return stable health issue codes for state, in the documented order."""
-    raise NotImplementedError("check_health is not implemented")
+    # Allow invalidated states through so STATE_INVALID can be reported.
+    _validate_state(state, allow_invalidated=True)
+
+    issues: list[str] = []
+    if state["invalidated"]:
+        issues.append("STATE_INVALID")
+    if state["entropy_count"] < MIN_ENTROPY:
+        issues.append("ENTROPY_LOW")
+    # Defect 7 fix: both the generate count since the last reseed and the
+    # generation gap since the last reseed/PR refresh are monitored.
+    if state["reseed_counter"] > MAX_GENERATE_WITHOUT_RESEED:
+        issues.append("RESEED_REQUIRED")
+    if (
+        state["generation"] - state["last_reseed_generation"]
+        > MAX_GENERATE_WITHOUT_RESEED
+    ):
+        issues.append("STATE_STALE")
+    return issues
 
 
 def drbg_batch(requests: list[dict], config: dict) -> dict:
@@ -201,4 +511,48 @@ def drbg_batch(requests: list[dict], config: dict) -> dict:
     defaults plus request-level overrides.  No DRBG state is shared between
     requests.  Malformed input raises ValueError.
     """
-    raise NotImplementedError("drbg_batch is not implemented")
+    if not isinstance(requests, list):
+        raise ValueError("requests must be a list")
+    if not isinstance(config, dict):
+        raise ValueError("config must be a dict")
+
+    defaults = {
+        "entropy": config.get("entropy"),
+        "nonce": config.get("nonce", b""),
+        "personalization": config.get("personalization", b""),
+    }
+    if defaults["entropy"] is None:
+        raise ValueError("config must provide default entropy")
+    for name in ("entropy", "nonce", "personalization"):
+        _require_bytes(defaults[name], f"config.{name}")
+
+    outputs: list[bytes] = []
+    states: list[dict] = []
+    for index, request in enumerate(requests):
+        if not isinstance(request, dict):
+            raise ValueError(f"request {index} must be a dict")
+        if "nbytes" not in request:
+            raise ValueError(f"request {index} is missing nbytes")
+
+        entropy = request.get("entropy", defaults["entropy"])
+        nonce = request.get("nonce", defaults["nonce"])
+        personalization = request.get(
+            "personalization", defaults["personalization"]
+        )
+        additional = request.get("additional", b"")
+        for name, value in (
+            ("entropy", entropy),
+            ("nonce", nonce),
+            ("personalization", personalization),
+            ("additional", additional),
+        ):
+            _require_bytes(value, f"request {index}.{name}")
+
+        # Defect 10 fix: every request gets its own freshly instantiated
+        # state, so no output stream can continue a previous request's state.
+        local_state = instantiate(entropy, nonce, personalization)
+        result = generate(local_state, request["nbytes"], additional)
+        outputs.append(result["output"])
+        states.append(result["state"])
+
+    return {"outputs": outputs, "states": states}
